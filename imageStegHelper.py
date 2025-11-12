@@ -1,153 +1,147 @@
-from PIL import Image
-import numpy as np
-import heapq
-from collections import defaultdict
 import os
+import math
+import struct
+import numpy as np
+from PIL import Image
+from Crypto.Cipher import AES
+from Crypto.Protocol.KDF import PBKDF2
+from Crypto.Random import get_random_bytes
 
-class HuffmanNode:
-    def __init__(self, char, freq):
-        self.char = char
-        self.freq = freq
-        self.left = None
-        self.right = None
+# ---------------- AES Encryption ----------------
+def derive_key(password, salt):
+    return PBKDF2(password.encode(), salt, dkLen=32, count=150000)
 
-    def __lt__(self, other):
-        return self.freq < other.freq
+def aes_encrypt(data, password):
+    salt = get_random_bytes(16)
+    iv = get_random_bytes(16)
+    key = derive_key(password, salt)
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    pad_len = 16 - len(data) % 16
+    data += bytes([pad_len]) * pad_len
+    ciphertext = cipher.encrypt(data)
+    return salt + iv + ciphertext
 
-class ImageSteg:
+def aes_decrypt(data, password):
+    salt, iv, ciphertext = data[:16], data[16:32], data[32:]
+    key = derive_key(password, salt)
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    padded = cipher.decrypt(ciphertext)
+    pad_len = padded[-1]
+    return padded[:-pad_len]
+
+# ---------------- Bit Helper Functions ----------------
+def bytes_to_bits(data):
+    return ''.join(format(b, '08b') for b in data)
+
+def bits_to_bytes(bitstring):
+    return bytes(int(bitstring[i:i+8], 2) for i in range(0, len(bitstring), 8))
+
+# =======================================================
+# 🔹 Main Class
+# =======================================================
+class AdaptiveTextSteg:
     def __init__(self):
         pass
 
-    # Methods for Huffman Coding
-    def build_huffman_tree(self, text):
-        frequency = defaultdict(int)
-        for char in text:
-            frequency[char] += 1
+    def _embed_bits(self, img_array, bitstream):
+        flat = img_array.flatten()
+        if len(bitstream) > len(flat):
+            raise ValueError("Not enough pixels to embed all bits.")
+        for i, bit in enumerate(bitstream):
+            flat[i] = (flat[i] & 0xFE) | int(bit)
+        return flat.reshape(img_array.shape)
 
-        priority_queue = [HuffmanNode(char, freq) for char, freq in frequency.items()]
-        heapq.heapify(priority_queue)
+    def _extract_bits(self, img_array, total_bits):
+        flat = img_array.flatten()
+        return ''.join(str(flat[i] & 1) for i in range(total_bits))
 
-        while len(priority_queue) > 1:
-            left = heapq.heappop(priority_queue)
-            right = heapq.heappop(priority_queue)
-            merged = HuffmanNode(None, left.freq + right.freq)
-            merged.left = left
-            merged.right = right
-            heapq.heappush(priority_queue, merged)
+    # ---------- Adaptive Embedding ----------
+    def encrypt_text_in_images(self, image_paths, message, password, output_folder="Results"):
+        os.makedirs(output_folder, exist_ok=True)
 
-        return priority_queue[0]
+        # Encrypt message
+        encrypted = aes_encrypt(message.encode(), password)
+        ciphertext_bits = bytes_to_bits(encrypted)
 
-    def build_huffman_codes(self, root, prefix="", codes=None):
-        if codes is None:
-            codes = {}
-        if root is not None:
-            if root.char is not None:
-                codes[root.char] = prefix
-            self.build_huffman_codes(root.left, prefix + "0", codes)
-            self.build_huffman_codes(root.right, prefix + "1", codes)
-        return codes
+        # Prefix 32-bit header for ciphertext length
+        header = struct.pack(">I", len(ciphertext_bits))
+        header_bits = bytes_to_bits(header)
+        full_bits = header_bits + ciphertext_bits
 
-    def huffman_compress(self, text):
-        root = self.build_huffman_tree(text)
-        codes = self.build_huffman_codes(root)
-        encoded_text = "".join(codes[char] for char in text)
-        return encoded_text, codes
+        print(f"🔐 Total bits to embed: {len(full_bits)}")
 
-    def huffman_decompress(self, text, codes):
-        decoded_text = ""
-        current_code = ""
-        for bit in text:
-            current_code += bit
-            for char, code in codes.items():
-                if code == current_code:
-                    decoded_text += char
-                    current_code = ""
-                    break
-        return decoded_text
+        remaining_bits = full_bits
+        stego_paths = []
 
-    # Method for Run-Length Encoding
-    def rle_compress(self, text):
-        encoded_text = ""
-        count = 1
-        for i in range(1, len(text)):
-            if text[i] == text[i - 1]:
-                count += 1
+        for i, path in enumerate(image_paths):
+            img = Image.open(path)
+            arr = np.array(img.convert("RGB"))
+            capacity = arr.size
+
+            print(f"📷 Using {os.path.basename(path)} | Capacity: {capacity} bits")
+
+            if len(remaining_bits) > capacity:
+                part_bits = remaining_bits[:capacity]
+                remaining_bits = remaining_bits[capacity:]
             else:
-                encoded_text += str(count) + text[i - 1]
-                count = 1
-        encoded_text += str(count) + text[-1]
-        return encoded_text
+                part_bits = remaining_bits
+                remaining_bits = ""
 
-    def rle_decompress(self, text):
-        decoded_text = ""
-        i = 0
-        while i < len(text):
-            count = int(text[i])
-            char = text[i + 1]
-            decoded_text += char * count
-            i += 2
-        return decoded_text
+            modified = self._embed_bits(arr, part_bits)
+            save_path = os.path.join(output_folder, f"stego_part_{i+1}.png")
+            Image.fromarray(modified.astype(np.uint8)).save(save_path)
+            stego_paths.append(save_path)
+            print(f"✅ Embedded {len(part_bits)} bits → {save_path}")
 
-    def __fillMSB(self, inp):
-        '''
-        0b01100 -> [0,0,0,0,1,1,0,0]
-        '''
-        inp = inp.split("b")[-1]
-        inp = '0'*(7-len(inp))+inp
-        return [int(x) for x in inp]
-
-    def __decrypt_pixels(self, pixels):
-        '''
-        Given list of 7 pixel values -> Determine 0/1 -> Join 7 0/1s to form binary -> integer -> character
-        '''
-        pixels = [str(x%2) for x in pixels]
-        bin_repr = "".join(pixels)
-        return chr(int(bin_repr,2))
-
-    def encrypt_text_in_image(self, image_path, msg, target_path=""):
-        '''
-        Read image -> Flatten -> encrypt images using LSB -> reshape and repack -> return image
-        '''
-        img = np.array(Image.open(image_path))
-        imgArr = img.flatten()
-        msg += "<-END->"
-        msgArr = [self.__fillMSB(bin(ord(ch))) for ch in msg]
-        
-        idx = 0
-        for char in msgArr:
-            for bit in char:
-                if bit==1:
-                    if imgArr[idx]==0:
-                        imgArr[idx] = 1
-                    else:
-                        imgArr[idx] = imgArr[idx] if imgArr[idx]%2==1 else imgArr[idx]-1
-                else: 
-                    if imgArr[idx]==255:
-                        imgArr[idx] = 254
-                    else:
-                        imgArr[idx] = imgArr[idx] if imgArr[idx]%2==0 else imgArr[idx]+1   
-                idx += 1
-            
-        filename = os.path.basename(image_path)
-        savePath = os.path.join(target_path, filename.split(".")[0] + "_embedded.png")
-
-        resImg = Image.fromarray(np.reshape(imgArr, img.shape))
-        resImg.save(savePath)
-        return savePath
-
-    def decrypt_text_in_image(self, image_path):
-        '''
-        Read image -> Extract Text -> Return
-        '''
-        img = np.array(Image.open(image_path))
-        imgArr = np.array(img).flatten()
-        
-        decrypted_message = ""
-        for i in range(7,len(imgArr),7):
-            decrypted_char = self.__decrypt_pixels(imgArr[i-7:i])
-            decrypted_message += decrypted_char
-
-            if len(decrypted_message)>10 and decrypted_message[-7:] == "<-END->":
+            if not remaining_bits:
                 break
 
-        return decrypted_message[:-7]
+        if remaining_bits:
+            print("⚠️ Not enough capacity! Add more images.")
+        else:
+            print("✅ Message successfully embedded.")
+
+        return stego_paths
+
+    def decrypt_text_from_images(self, stego_paths, password):
+        """Extract the full encrypted message (with known header)."""
+        bitstream = ""
+        for path in stego_paths:
+            img = Image.open(path)
+            arr = np.array(img.convert("RGB"))
+            bitstream += ''.join(str(x & 1) for x in arr.flatten())
+
+        # Extract header → message length
+        header_bits = bitstream[:32]
+        header_bytes = bits_to_bytes(header_bits)
+        msg_length = struct.unpack(">I", header_bytes)[0]
+
+        print(f"🧩 Detected message length: {msg_length} bits")
+
+        cipher_bits = bitstream[32:32 + msg_length]
+        cipher_bytes = bits_to_bytes(cipher_bits)
+
+        decrypted = aes_decrypt(cipher_bytes, password)
+        return decrypted.decode(errors="ignore")
+
+# =======================================================
+# 🧠 CLI Interface
+# =======================================================
+if __name__ == "__main__":
+    steg = AdaptiveTextSteg()
+    print("🔹 Adaptive Text Steganography System")
+    mode = input("1️⃣ Encrypt Text  2️⃣ Decrypt Text  → Enter choice: ")
+
+    if mode == "1":
+        images = input("Enter image paths (comma separated): ").split(",")
+        msg = input("Enter your secret message: ")
+        pwd = input("Enter password: ")
+        out_folder = input("Enter output folder (default=Results): ") or "Results"
+        steg.encrypt_text_in_images([p.strip() for p in images], msg, pwd, out_folder)
+
+    elif mode == "2":
+        images = input("Enter stego image paths (comma separated): ").split(",")
+        pwd = input("Enter password: ")
+        print("🕵️ Extracting...")
+        result = steg.decrypt_text_from_images([p.strip() for p in images], pwd)
+        print("📜 Decrypted Message:", result)
